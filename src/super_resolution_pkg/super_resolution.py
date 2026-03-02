@@ -84,24 +84,22 @@ def has_audio_stream(video_path):
 
 
 def get_device_config():
-    """Detects the best available hardware and returns (gpu_id, use_half) configuration.
+    """Detects the best available hardware and returns (gpu_id, use_half, device) configuration.
 
     Returns:
-        tuple: (gpu_id, use_half) where gpu_id is 0 for CUDA, None for MPS/CPU,
-               and use_half indicates whether FP16 precision can be used.
+        tuple: (gpu_id, use_half, device) where gpu_id is 0 for CUDA, None for MPS/CPU,
+               use_half indicates whether FP16 precision can be used, and device is a
+               torch.device for the selected backend.
     """
     if torch.cuda.is_available():
         print("Detected NVIDIA GPU with CUDA support.")
-        return 0, True
+        return 0, True, torch.device('cuda:0')
     elif torch.backends.mps.is_available():
         print("Detected Apple Silicon GPU (MPS).")
-        # RealESRGANer uses gpu_id=None to fall back to auto device selection;
-        # MPS is picked up via PyTorch's default device when CUDA is absent.
-        # FP16 (half) is unreliable on MPS for many operations.
-        return None, False
+        return None, False, torch.device('mps')
     else:
         print("No GPU detected. Using CPU (this will be slow).")
-        return None, False
+        return None, False, torch.device('cpu')
 
 
 def initialize_upsampler(scale):
@@ -117,7 +115,7 @@ def initialize_upsampler(scale):
         print("Error: Invalid scale factor. Please choose 2 or 4.")
         return None
 
-    gpu_id, use_half = get_device_config()
+    gpu_id, use_half, device = get_device_config()
 
     print(f"Initializing Real-ESRGAN model for {scale}x upscaling...")
     upsampler = RealESRGANer(
@@ -130,6 +128,13 @@ def initialize_upsampler(scale):
         half=use_half,
         gpu_id=gpu_id
     )
+
+    # RealESRGANer only knows about CUDA and CPU. When running on Apple Silicon,
+    # manually move the model and override the device so MPS is actually used.
+    if device.type == 'mps':
+        upsampler.device = device
+        upsampler.model.to(device)
+
     return upsampler
 
 
