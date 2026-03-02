@@ -5,6 +5,7 @@ import argparse
 import cv2
 import shutil
 import time
+import torch
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from realesrgan import RealESRGANer
 
@@ -82,6 +83,27 @@ def has_audio_stream(video_path):
         return False
 
 
+def get_device_config():
+    """Detects the best available hardware and returns (gpu_id, use_half) configuration.
+
+    Returns:
+        tuple: (gpu_id, use_half) where gpu_id is 0 for CUDA, None for MPS/CPU,
+               and use_half indicates whether FP16 precision can be used.
+    """
+    if torch.cuda.is_available():
+        print("Detected NVIDIA GPU with CUDA support.")
+        return 0, True
+    elif torch.backends.mps.is_available():
+        print("Detected Apple Silicon GPU (MPS).")
+        # RealESRGANer uses gpu_id=None to fall back to auto device selection;
+        # MPS is picked up via PyTorch's default device when CUDA is absent.
+        # FP16 (half) is unreliable on MPS for many operations.
+        return None, False
+    else:
+        print("No GPU detected. Using CPU (this will be slow).")
+        return None, False
+
+
 def initialize_upsampler(scale):
     """Initializes the Real-ESRGAN upsampler."""
     base_model_dir = os.path.join(os.path.dirname(__file__), "models")
@@ -95,6 +117,8 @@ def initialize_upsampler(scale):
         print("Error: Invalid scale factor. Please choose 2 or 4.")
         return None
 
+    gpu_id, use_half = get_device_config()
+
     print(f"Initializing Real-ESRGAN model for {scale}x upscaling...")
     upsampler = RealESRGANer(
         scale=scale,
@@ -103,8 +127,8 @@ def initialize_upsampler(scale):
         tile=0,
         tile_pad=10,
         pre_pad=0,
-        half=True,
-        gpu_id=0
+        half=use_half,
+        gpu_id=gpu_id
     )
     return upsampler
 
