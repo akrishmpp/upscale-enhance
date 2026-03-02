@@ -126,15 +126,9 @@ def initialize_upsampler(scale):
         tile_pad=10,
         pre_pad=0,
         half=use_half,
-        gpu_id=gpu_id
+        gpu_id=gpu_id,
+        device=device
     )
-
-    # RealESRGANer only knows about CUDA and CPU. When running on Apple Silicon,
-    # manually move the model and override the device so MPS is actually used.
-    if device.type == 'mps':
-        upsampler.device = device
-        upsampler.model.to(device)
-
     return upsampler
 
 
