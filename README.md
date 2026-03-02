@@ -7,7 +7,7 @@ This project provides a powerful tool for upscaling videos and images to higher 
 - **High-Quality Upscaling:** Utilizes Real-ESRGAN, a cutting-edge super-resolution model, to produce sharp and detailed results.
 - **Video and Image Support:** Upscale both videos (MP4, MKV, AVI, MOV) and images (PNG, JPG, WEBP).
 - **Flexible Resolution Control:** Choose between a specific scaling factor (e.g., 2x, 4x) or a target resolution (e.g., 1080p, 4k).
-- **Hardware Accelerated:** Leverages NVIDIA GPUs for fast processing.
+- **Hardware Accelerated:** Supports NVIDIA GPUs (CUDA), Apple Silicon GPUs (MPS), and CPU fallback.
 - **Audio Preservation:** Automatically preserves the original audio track in upscaled videos.
 
 ## macOS App
@@ -19,8 +19,8 @@ A native macOS app with a user-friendly interface is available on the Mac App St
 ## Prerequisites
 
 - **Python 3.8+**
-- **NVIDIA GPU** with CUDA and cuDNN installed.
-- **ffmpeg:** Required for video processing. You can install it using your system's package manager (e.g., `sudo apt-get install ffmpeg` on Debian/Ubuntu).
+- **GPU (recommended):** NVIDIA GPU with CUDA/cuDNN, or Apple Silicon Mac (M1/M2/M3/M4/M5) with PyTorch MPS support. CPU-only mode is supported but significantly slower.
+- **ffmpeg:** Required for video processing. Install via your package manager (e.g., `sudo apt-get install ffmpeg` on Debian/Ubuntu, `brew install ffmpeg` on macOS).
 
 ## Installation
 
