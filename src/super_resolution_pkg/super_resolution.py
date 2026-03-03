@@ -159,6 +159,42 @@ def get_device_config():
         return None, False, torch.device('cpu')
 
 
+def _detect_hw_encoder():
+    """Return the best available H.264 encoder and its flags.
+
+    Checks for hardware encoders (NVENC, VideoToolbox) and falls back to
+    libx264 with a faster preset to reduce encoder backpressure.
+
+    Returns:
+        list: ffmpeg flags for the chosen encoder, e.g.
+              ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "18"]
+    """
+    # NVENC (NVIDIA)
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i",
+             "nullsrc=s=64x64:d=0.04", "-c:v", "h264_nvenc", "-f", "null", "-"],
+            capture_output=True, timeout=10)
+        if result.returncode == 0:
+            # p4 ≈ medium quality, much faster than libx264
+            return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "18"]
+    except Exception:
+        pass
+    # VideoToolbox (macOS)
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i",
+             "nullsrc=s=64x64:d=0.04", "-c:v", "h264_videotoolbox", "-f",
+             "null", "-"],
+            capture_output=True, timeout=10)
+        if result.returncode == 0:
+            return ["-c:v", "h264_videotoolbox", "-q:v", "55"]
+    except Exception:
+        pass
+    # Software fallback – use "fast" preset instead of default "medium".
+    return ["-c:v", "libx264", "-preset", "fast", "-crf", "18"]
+
+
 def run_mps_diagnostics(upsampler):
     """Run thorough checks to verify MPS is actually being used for inference.
 
@@ -346,6 +382,11 @@ def initialize_upsampler(scale):
 
     gpu_id, use_half, device = get_device_config()
 
+    # CUDA-specific optimisations for conv-heavy models on fixed-size inputs.
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        model = model.to(memory_format=torch.channels_last)
+
     # Pick tile size based on device and available memory.
     # tile=0 means no tiling (full-frame inference, fastest but most memory).
     if gpu_id is not None:
@@ -425,6 +466,22 @@ def initialize_upsampler(scale):
             upsampler.model.float()
             upsampler.half = False
 
+    # torch.compile() gives 1.5-2x speedup for repeated same-shape
+    # inference (video frames).  Only available in PyTorch 2+ and currently
+    # reliable on CUDA; MPS support is experimental and can hang.
+    if hasattr(torch, "compile") and device.type == "cuda":
+        print("Compiling model with torch.compile() for faster inference...")
+        try:
+            upsampler.model = torch.compile(upsampler.model)
+            # Run a small inference to trigger compilation now rather than
+            # penalising the first real frame.
+            warmup_img = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
+            upsampler.enhance(warmup_img)
+            torch.cuda.synchronize()
+            print("Model compiled successfully.")
+        except Exception as e:
+            print(f"torch.compile() not available ({e}), continuing without it.")
+
     return upsampler
 
 
@@ -437,7 +494,8 @@ def upscale_image(input_path, output_path, upsampler, target_resolution):
         return
 
     try:
-        upscaled_img, _ = upsampler.enhance(img)
+        with torch.inference_mode():
+            upscaled_img, _ = upsampler.enhance(img)
         final_img = cv2.resize(upscaled_img, target_resolution, interpolation=cv2.INTER_LANCZOS4)
         cv2.imwrite(output_path, final_img)
         end_time = time.time()
@@ -518,7 +576,8 @@ def upscale_video(input_path, output_path, upsampler, target_resolution):
 
         # Quality mode
         t0 = time.time()
-        quality_out, _ = upsampler.enhance(test_frame)
+        with torch.inference_mode():
+            quality_out, _ = upsampler.enhance(test_frame)
         quality_out = cv2.resize(quality_out, target_resolution,
                                  interpolation=cv2.INTER_LANCZOS4)
         quality_time = time.time() - t0
@@ -533,7 +592,8 @@ def upscale_video(input_path, output_path, upsampler, target_resolution):
             pre_resized = cv2.resize(test_frame, (optimal_in_w, optimal_in_h),
                                      interpolation=cv2.INTER_LANCZOS4)
             t0 = time.time()
-            fast_out, _ = upsampler.enhance(pre_resized)
+            with torch.inference_mode():
+                fast_out, _ = upsampler.enhance(pre_resized)
             fast_out = cv2.resize(fast_out, target_resolution,
                                   interpolation=cv2.INTER_LANCZOS4)
             fast_time = time.time() - t0
@@ -601,6 +661,7 @@ def upscale_video(input_path, output_path, upsampler, target_resolution):
         decode_proc = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE)
 
         # Encode pipe: stdin raw BGR24 frames -> ffmpeg -> output file
+        encoder_flags = _detect_hw_encoder()
         encode_cmd = [
             "ffmpeg", "-y",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
@@ -610,16 +671,18 @@ def upscale_video(input_path, output_path, upsampler, target_resolution):
         ]
         if has_audio:
             encode_cmd.extend(["-i", audio_path, "-c:a", "copy"])
+        encode_cmd.extend(encoder_flags)
         encode_cmd.extend([
-            "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-pix_fmt", "yuv420p",
             "-v", "error",
             output_path,
         ])
         encode_proc = subprocess.Popen(encode_cmd, stdin=subprocess.PIPE)
 
-        # Threaded pipeline
-        read_q = queue.Queue(maxsize=4)
-        write_q = queue.Queue(maxsize=4)
+        # Threaded pipeline – larger queues absorb variability between
+        # decode/inference/encode stages and reduce stalls.
+        read_q = queue.Queue(maxsize=8)
+        write_q = queue.Queue(maxsize=8)
         error_event = threading.Event()
         frame_byte_size = in_w * in_h * 3
 
@@ -677,7 +740,8 @@ def upscale_video(input_path, output_path, upsampler, target_resolution):
 
                 frame_start = time.time()
                 try:
-                    upscaled, _ = upsampler.enhance(img)
+                    with torch.inference_mode():
+                        upscaled, _ = upsampler.enhance(img)
                 except Exception as e:
                     print(f"\nError upscaling frame {i + 1}: {e}")
                     error_event.set()
