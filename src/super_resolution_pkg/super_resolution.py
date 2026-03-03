@@ -3,8 +3,9 @@ import subprocess
 import tempfile
 import argparse
 import platform
+import queue
+import threading
 import cv2
-import shutil
 import time
 import torch
 import numpy as np
@@ -27,8 +28,6 @@ except ModuleNotFoundError:
 
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from realesrgan import RealESRGANer
-
-MIN_REQUIRED_DISK_SPACE_GB = 50 # Minimum required disk space in GB
 
 RESOLUTION_MAP = {
     "1080p": (1920, 1080),
@@ -102,6 +101,45 @@ def has_audio_stream(video_path):
         return False
 
 
+def get_video_frame_count(video_path):
+    """Gets the total number of frames in a video using container metadata."""
+    command = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=nb_frames",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path,
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        count = result.stdout.strip()
+        if count and count != "N/A":
+            return int(count)
+    except Exception:
+        pass
+    return None
+
+
+def get_system_memory_gb():
+    """Returns total physical memory in GB, or None if detection fails."""
+    try:
+        # macOS: sysctl hw.memsize returns total bytes
+        result = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            capture_output=True, text=True, check=True
+        )
+        return int(result.stdout.strip()) / (1024 ** 3)
+    except Exception:
+        pass
+    try:
+        # Linux fallback
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return pages * page_size / (1024 ** 3)
+    except Exception:
+        return None
+
+
 def get_device_config():
     """Detects the best available hardware and returns (gpu_id, use_half, device) configuration.
 
@@ -143,8 +181,10 @@ def run_mps_diagnostics(upsampler):
     print(f"\n{SEPARATOR}")
     print("1. System Information")
     print(SEPARATOR)
+    mem_gb = get_system_memory_gb()
     print(f"  Platform     : {platform.platform()}")
     print(f"  Processor    : {platform.processor() or 'N/A'}")
+    print(f"  Memory       : {f'{mem_gb:.0f} GB' if mem_gb else 'unknown'}")
     print(f"  Python       : {platform.python_version()}")
     print(f"  PyTorch      : {torch.__version__}")
 
@@ -306,11 +346,31 @@ def initialize_upsampler(scale):
 
     gpu_id, use_half, device = get_device_config()
 
-    # Use tiling on MPS/CPU to reduce peak memory usage.
-    # Full-frame inference in FP32 on MPS can exhaust unified memory and cause
-    # the system to swap, which tanks performance.
-    tile = 0 if gpu_id is not None else 512
+    # Pick tile size based on device and available memory.
+    # tile=0 means no tiling (full-frame inference, fastest but most memory).
+    if gpu_id is not None:
+        # CUDA: dedicated VRAM, no tiling needed
+        tile = 0
+    elif device.type == "mps":
+        # Apple Silicon: GPU shares unified memory with CPU.
+        # Larger tiles = fewer GPU dispatch round-trips = much faster.
+        # A 720p frame with tile=512 produces 6 tiles; tile=0 does it in one pass.
+        mem_gb = get_system_memory_gb()
+        if mem_gb is not None:
+            print(f"System memory: {mem_gb:.0f} GB")
+            if mem_gb >= 16:
+                tile = 0     # no tiling — 720p/1080p fits comfortably
+            elif mem_gb >= 8:
+                tile = 768   # 2 tiles for 720p instead of 6
+            else:
+                tile = 512
+        else:
+            tile = 512  # safe fallback if detection fails
+    else:
+        # CPU: conservative tiling
+        tile = 512
 
+    print(f"Tile size: {tile if tile > 0 else 'disabled (full-frame)'}")
     print(f"Initializing Real-ESRGAN model for {scale}x upscaling...")
     upsampler = RealESRGANer(
         scale=scale,
@@ -365,120 +425,177 @@ def upscale_image(input_path, output_path, upsampler, target_resolution):
 
 
 def upscale_video(input_path, output_path, upsampler, target_resolution):
-    """
-    Upscales a video using Real-ESRGAN.
+    """Upscales a video using Real-ESRGAN with pipelined I/O.
+
+    Uses ffmpeg pipes for both decode and encode to eliminate all
+    intermediate files.  A 3-stage threaded pipeline overlaps disk/pipe
+    I/O with GPU inference:
+        reader thread  →  read_q  →  main thread (GPU)  →  write_q  →  writer thread
     """
     start_time = time.time()
     if not os.path.exists(input_path):
         print(f"Error: Input file not found at {input_path}")
         return
 
+    input_res = get_input_resolution(input_path)
+    if input_res is None:
+        print("Error: Could not determine input video resolution.")
+        return
+    in_w, in_h = input_res
+    target_w, target_h = target_resolution
+    framerate = get_video_framerate(input_path)
+    total_frames = get_video_frame_count(input_path)
+    has_audio = has_audio_stream(input_path)
+
+    print(f"Video: {in_w}x{in_h} -> {target_w}x{target_h}, "
+          f"{total_frames or '?'} frames at {framerate:.2f} fps")
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        # Check for sufficient disk space
-        total, used, free = shutil.disk_usage(temp_dir)
-        free_gb = free / (1024**3)
-        if free_gb < MIN_REQUIRED_DISK_SPACE_GB:
-            print(f"Error: Insufficient disk space in temporary directory ({temp_dir}).")
-            print(f"Available: {free_gb:.2f} GB, Required: {MIN_REQUIRED_DISK_SPACE_GB} GB.")
-            return
-
-        frames_dir = os.path.join(temp_dir, "frames")
-        upscaled_frames_dir = os.path.join(temp_dir, "upscaled_frames")
-        os.makedirs(frames_dir)
-        os.makedirs(upscaled_frames_dir)
-
+        # Extract audio to a temp file (only file we write to disk).
         audio_path = os.path.join(temp_dir, "audio.aac")
-        has_audio = has_audio_stream(input_path)
-        
-        print(f"Extracting frames from {input_path}...")
-        try:
-            # Extract frames
-            subprocess.run(
-                ["ffmpeg", "-i", input_path, "-q:v", "1", "-pix_fmt", "rgb24", f"{frames_dir}/frame_%06d.png"],
-                check=True, capture_output=True, text=True
-            )
-            if has_audio:
-                print("Extracting audio...")
-                # Extract audio
+        if has_audio:
+            print("Extracting audio...")
+            try:
                 subprocess.run(
                     ["ffmpeg", "-i", input_path, "-vn", "-acodec", "copy", audio_path],
                     check=True, capture_output=True, text=True
                 )
-        except subprocess.CalledProcessError as e:
-            print("Error during ffmpeg extraction:")
-            print(e.stderr)
-            return
+            except subprocess.CalledProcessError as e:
+                print(f"Error extracting audio: {e.stderr}")
+                return
 
-        frame_files = sorted(os.listdir(frames_dir))
-        total_frames = len(frame_files)
-        print(f"Successfully extracted {total_frames} frames.")
+        # --- Decode pipe: ffmpeg decodes video -> raw BGR24 frames -> stdout ---
+        decode_cmd = [
+            "ffmpeg", "-i", input_path,
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-v", "error", "pipe:1",
+        ]
+        decode_proc = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE)
 
-        print("Starting frame upscaling...")
-        frame_times = []
-        for i, frame_name in enumerate(frame_files):
-            frame_start = time.time()
-            frame_path = os.path.join(frames_dir, frame_name)
-            img = cv2.imread(frame_path, cv2.IMREAD_UNCHANGED)
+        # --- Encode pipe: stdin raw BGR24 frames -> ffmpeg encodes -> output file ---
+        encode_cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{target_w}x{target_h}",
+            "-r", str(framerate),
+            "-i", "pipe:0",
+        ]
+        if has_audio:
+            encode_cmd.extend(["-i", audio_path, "-c:a", "copy"])
+        encode_cmd.extend([
+            "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-v", "error",
+            output_path,
+        ])
+        encode_proc = subprocess.Popen(encode_cmd, stdin=subprocess.PIPE)
 
+        # --- Threaded pipeline ---
+        read_q = queue.Queue(maxsize=4)
+        write_q = queue.Queue(maxsize=4)
+        error_event = threading.Event()
+        frame_byte_size = in_w * in_h * 3
+
+        def reader():
+            """Reads raw decoded frames from the ffmpeg decode pipe."""
             try:
-                upscaled_img, _ = upsampler.enhance(img)
-                final_img = cv2.resize(upscaled_img, target_resolution, interpolation=cv2.INTER_LANCZOS4)
-                save_path = os.path.join(upscaled_frames_dir, frame_name)
-                cv2.imwrite(save_path, final_img)
-            except Exception as e:
-                print(f"\nError upscaling frame {frame_name}: {e}")
-                return # Stop processing
+                while not error_event.is_set():
+                    raw = decode_proc.stdout.read(frame_byte_size)
+                    if len(raw) < frame_byte_size:
+                        read_q.put(None)  # EOF sentinel
+                        break
+                    frame = np.frombuffer(raw, dtype=np.uint8).reshape(in_h, in_w, 3).copy()
+                    read_q.put(frame)
+            except Exception:
+                error_event.set()
+                read_q.put(None)
 
-            frame_elapsed = time.time() - frame_start
-            frame_times.append(frame_elapsed)
+        def writer():
+            """Resizes upscaled frames and writes them to the ffmpeg encode pipe."""
+            try:
+                while not error_event.is_set():
+                    item = write_q.get()
+                    if item is None:
+                        break
+                    final = cv2.resize(item, target_resolution, interpolation=cv2.INTER_LANCZOS4)
+                    encode_proc.stdin.write(final.tobytes())
+            except Exception:
+                error_event.set()
 
-            # After the first real frame, print a prominent timing report so the
-            # user can decide whether to continue or abort.
-            if i == 0:
-                est_total = frame_elapsed * total_frames
-                est_min, est_sec = divmod(int(est_total), 60)
-                est_hr, est_min = divmod(est_min, 60)
-                print(f"\nFirst frame took {frame_elapsed:.2f}s. "
-                      f"Estimated total time: {est_hr}h{est_min:02d}m{est_sec:02d}s "
-                      f"for {total_frames} frames. Press Ctrl+C to cancel.\n")
+        reader_thread = threading.Thread(target=reader, daemon=True)
+        writer_thread = threading.Thread(target=writer, daemon=True)
+        reader_thread.start()
+        writer_thread.start()
 
-            avg_time = sum(frame_times) / len(frame_times)
-            remaining = avg_time * (total_frames - (i + 1))
-            eta_min, eta_sec = divmod(int(remaining), 60)
-            eta_hr, eta_min = divmod(eta_min, 60)
-            pct = 100.0 * (i + 1) / total_frames
-            print(f"Frame {i + 1}/{total_frames} [{pct:5.1f}%] "
-                  f"({frame_elapsed:.2f}s/frame, ETA: {eta_hr}h{eta_min:02d}m{eta_sec:02d}s)  ", end="\r")
-
-        print("\nUpscaling complete.")
-        
-        print("Reassembling video with upscaled frames and original audio...")
+        # --- Main thread: GPU inference ---
+        print("Starting pipelined upscaling (decode -> GPU -> encode)...")
+        frame_times = []
+        i = 0
         try:
-            framerate = get_video_framerate(input_path)
-            reassemble_command = [
-                "ffmpeg",
-                "-r", str(framerate),
-                "-i", f"{upscaled_frames_dir}/frame_%06d.png",
-            ]
-            if has_audio:
-                reassemble_command.extend(["-i", audio_path, "-c:a", "copy"])
-            
-            reassemble_command.extend([
-                "-c:v", "libx264",
-                "-crf", "18",
-                "-pix_fmt", "yuv420p",
-                output_path,
-            ])
-            subprocess.run(reassemble_command, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            print("Error during ffmpeg reassembly:")
-            print(e.stderr)
+            while True:
+                img = read_q.get()
+                if img is None or error_event.is_set():
+                    write_q.put(None)
+                    break
+
+                frame_start = time.time()
+                try:
+                    upscaled, _ = upsampler.enhance(img)
+                except Exception as e:
+                    print(f"\nError upscaling frame {i + 1}: {e}")
+                    error_event.set()
+                    write_q.put(None)
+                    break
+                write_q.put(upscaled)
+                frame_elapsed = time.time() - frame_start
+                frame_times.append(frame_elapsed)
+
+                if i == 0 and total_frames:
+                    est_total = frame_elapsed * total_frames
+                    est_min, est_sec = divmod(int(est_total), 60)
+                    est_hr, est_min = divmod(est_min, 60)
+                    print(f"\nFirst frame took {frame_elapsed:.2f}s. "
+                          f"Estimated total time: {est_hr}h{est_min:02d}m{est_sec:02d}s "
+                          f"for {total_frames} frames. Press Ctrl+C to cancel.\n")
+
+                frames_done = i + 1
+                if total_frames:
+                    avg_time = sum(frame_times) / len(frame_times)
+                    remaining = avg_time * (total_frames - frames_done)
+                    eta_min, eta_sec = divmod(int(remaining), 60)
+                    eta_hr, eta_min = divmod(eta_min, 60)
+                    pct = 100.0 * frames_done / total_frames
+                    print(f"Frame {frames_done}/{total_frames} [{pct:5.1f}%] "
+                          f"({frame_elapsed:.2f}s/frame, "
+                          f"ETA: {eta_hr}h{eta_min:02d}m{eta_sec:02d}s)  ", end="\r")
+                else:
+                    print(f"Frame {frames_done} ({frame_elapsed:.2f}s/frame)  ", end="\r")
+                i += 1
+
+        except KeyboardInterrupt:
+            print("\n\nInterrupted by user.")
+            error_event.set()
+            write_q.put(None)
+
+        # --- Cleanup ---
+        writer_thread.join(timeout=10)
+        try:
+            encode_proc.stdin.close()
+        except Exception:
+            pass
+        encode_proc.wait()
+        decode_proc.terminate()
+        decode_proc.wait()
+
+        if error_event.is_set():
+            print("Processing stopped due to errors.")
             return
 
     end_time = time.time()
-    print(f"Successfully created upscaled video at {output_path}")
-    print(f"Video processing took {end_time - start_time:.2f} seconds.")
+    total_processed = len(frame_times)
+    avg = (end_time - start_time) / total_processed if total_processed else 0
+    print(f"\nSuccessfully created upscaled video at {output_path}")
+    print(f"Processed {total_processed} frames in {end_time - start_time:.2f}s "
+          f"({avg:.2f}s/frame avg).")
 
 def process_file(input_file, output_file, args, upsampler):
     input_resolution = get_input_resolution(input_file)
