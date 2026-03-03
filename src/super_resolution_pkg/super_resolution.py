@@ -6,6 +6,20 @@ import cv2
 import shutil
 import time
 import torch
+
+# Compatibility shim: basicsr imports torchvision.transforms.functional_tensor,
+# which was removed in torchvision >= 0.16. Patch it before importing basicsr.
+import importlib
+try:
+    importlib.import_module('torchvision.transforms.functional_tensor')
+except ModuleNotFoundError:
+    import types
+    import torchvision.transforms.functional as F
+    fake_module = types.ModuleType('torchvision.transforms.functional_tensor')
+    fake_module.rgb_to_grayscale = F.rgb_to_grayscale
+    import sys
+    sys.modules['torchvision.transforms.functional_tensor'] = fake_module
+
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from realesrgan import RealESRGANer
 
