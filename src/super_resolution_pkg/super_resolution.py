@@ -6,6 +6,10 @@ import cv2
 import shutil
 import time
 import torch
+import numpy as np
+
+# Allow MPS to fall back to CPU for any unsupported ops, rather than crashing.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 # Compatibility shim: basicsr imports torchvision.transforms.functional_tensor,
 # which was removed in torchvision >= 0.16. Patch it before importing basicsr.
@@ -131,18 +135,40 @@ def initialize_upsampler(scale):
 
     gpu_id, use_half, device = get_device_config()
 
+    # Use tiling on MPS/CPU to reduce peak memory usage.
+    # Full-frame inference in FP32 on MPS can exhaust unified memory and cause
+    # the system to swap, which tanks performance.
+    tile = 0 if gpu_id is not None else 512
+
     print(f"Initializing Real-ESRGAN model for {scale}x upscaling...")
     upsampler = RealESRGANer(
         scale=scale,
         model_path=model_path,
         model=model,
-        tile=0,
+        tile=tile,
         tile_pad=10,
         pre_pad=0,
         half=use_half,
         gpu_id=gpu_id,
         device=device
     )
+
+    # Verify the model actually landed on the expected device.
+    actual_device = next(upsampler.model.parameters()).device
+    print(f"Model loaded on device: {actual_device}")
+    if str(actual_device) != str(device):
+        print(f"WARNING: Expected device '{device}', but model is on '{actual_device}'.")
+
+    # Warm up the MPS pipeline. The first inference triggers Metal shader
+    # compilation which is very slow; doing it on a tiny image avoids counting
+    # that cost against real frames.
+    if device.type == "mps":
+        print("Warming up MPS pipeline (compiling Metal shaders)...")
+        dummy = np.zeros((64, 64, 3), dtype=np.uint8)
+        upsampler.enhance(dummy)
+        torch.mps.synchronize()
+        print("MPS pipeline ready.")
+
     return upsampler
 
 
@@ -216,20 +242,41 @@ def upscale_video(input_path, output_path, upsampler, target_resolution):
         print(f"Successfully extracted {total_frames} frames.")
 
         print("Starting frame upscaling...")
+        frame_times = []
         for i, frame_name in enumerate(frame_files):
+            frame_start = time.time()
             frame_path = os.path.join(frames_dir, frame_name)
             img = cv2.imread(frame_path, cv2.IMREAD_UNCHANGED)
-            
+
             try:
                 upscaled_img, _ = upsampler.enhance(img)
                 final_img = cv2.resize(upscaled_img, target_resolution, interpolation=cv2.INTER_LANCZOS4)
                 save_path = os.path.join(upscaled_frames_dir, frame_name)
                 cv2.imwrite(save_path, final_img)
             except Exception as e:
-                print(f"Error upscaling frame {frame_name}: {e}")
+                print(f"\nError upscaling frame {frame_name}: {e}")
                 return # Stop processing
-            
-            print(f"Upscaled frame {i + 1}/{total_frames}", end="\r")
+
+            frame_elapsed = time.time() - frame_start
+            frame_times.append(frame_elapsed)
+
+            # After the first real frame, print a prominent timing report so the
+            # user can decide whether to continue or abort.
+            if i == 0:
+                est_total = frame_elapsed * total_frames
+                est_min, est_sec = divmod(int(est_total), 60)
+                est_hr, est_min = divmod(est_min, 60)
+                print(f"\nFirst frame took {frame_elapsed:.2f}s. "
+                      f"Estimated total time: {est_hr}h{est_min:02d}m{est_sec:02d}s "
+                      f"for {total_frames} frames. Press Ctrl+C to cancel.\n")
+
+            avg_time = sum(frame_times) / len(frame_times)
+            remaining = avg_time * (total_frames - (i + 1))
+            eta_min, eta_sec = divmod(int(remaining), 60)
+            eta_hr, eta_min = divmod(eta_min, 60)
+            pct = 100.0 * (i + 1) / total_frames
+            print(f"Frame {i + 1}/{total_frames} [{pct:5.1f}%] "
+                  f"({frame_elapsed:.2f}s/frame, ETA: {eta_hr}h{eta_min:02d}m{eta_sec:02d}s)  ", end="\r")
 
         print("\nUpscaling complete.")
         
