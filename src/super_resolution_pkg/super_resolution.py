@@ -394,13 +394,36 @@ def initialize_upsampler(scale):
 
     # Warm up the MPS pipeline. The first inference triggers Metal shader
     # compilation which is very slow; doing it on a tiny image avoids counting
-    # that cost against real frames.
+    # that cost against real frames.  We also use the warmup result as an FP32
+    # reference to test whether FP16 produces acceptable quality.
     if device.type == "mps":
         print("Warming up MPS pipeline (compiling Metal shaders)...")
-        dummy = np.zeros((64, 64, 3), dtype=np.uint8)
-        upsampler.enhance(dummy)
+        warmup_img = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
+        fp32_out, _ = upsampler.enhance(warmup_img)
         torch.mps.synchronize()
         print("MPS pipeline ready.")
+
+        # FP16 gives ~2x speedup on Apple Silicon (double FP16 throughput +
+        # halved memory bandwidth).  Test quality against FP32 reference.
+        print("Testing FP16 precision for faster inference...")
+        try:
+            upsampler.model.half()
+            upsampler.half = True
+            fp16_out, _ = upsampler.enhance(warmup_img)
+            torch.mps.synchronize()
+            diff = np.abs(fp32_out.astype(np.float32) - fp16_out.astype(np.float32))
+            if diff.max() <= 30:
+                print(f"  FP16 enabled (max pixel diff: {diff.max():.0f}/255, "
+                      f"mean: {diff.mean():.1f})")
+            else:
+                print(f"  FP16 quality insufficient (max diff: {diff.max():.0f}), "
+                      f"staying on FP32")
+                upsampler.model.float()
+                upsampler.half = False
+        except Exception as e:
+            print(f"  FP16 not available ({e}), staying on FP32")
+            upsampler.model.float()
+            upsampler.half = False
 
     return upsampler
 
@@ -424,13 +447,41 @@ def upscale_image(input_path, output_path, upsampler, target_resolution):
         print(f"Error upscaling image {input_path}: {e}")
 
 
+def extract_first_frame(input_path, width, height):
+    """Extracts the first frame from a video as a BGR numpy array."""
+    cmd = [
+        "ffmpeg", "-i", input_path,
+        "-frames:v", "1",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-v", "error", "pipe:1",
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    expected = width * height * 3
+    if len(result.stdout) < expected:
+        return None
+    return np.frombuffer(result.stdout, dtype=np.uint8).reshape(height, width, 3).copy()
+
+
+def _format_eta(secs_per_frame, total_frames):
+    """Format an ETA string from per-frame time and total frame count."""
+    if total_frames is None:
+        return "unknown"
+    total_s = int(secs_per_frame * total_frames)
+    h, rem = divmod(total_s, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m{s:02d}s"
+
+
 def upscale_video(input_path, output_path, upsampler, target_resolution):
     """Upscales a video using Real-ESRGAN with pipelined I/O.
 
-    Uses ffmpeg pipes for both decode and encode to eliminate all
-    intermediate files.  A 3-stage threaded pipeline overlaps disk/pipe
-    I/O with GPU inference:
-        reader thread  →  read_q  →  main thread (GPU)  →  write_q  →  writer thread
+    Flow:
+      1. Process a test frame so the user can inspect quality and timing.
+      2. Offer a "fast" mode that pre-resizes input when the model overshoots
+         the target (e.g. 4x on 720p → 2880p, but target is only 2160p).
+      3. User confirms before the full pipeline runs.
+      4. Three-stage threaded pipeline with ffmpeg pipes (zero intermediate files):
+           reader thread → read_q → main thread (GPU) → write_q → writer thread
     """
     start_time = time.time()
     if not os.path.exists(input_path):
@@ -450,21 +501,98 @@ def upscale_video(input_path, output_path, upsampler, target_resolution):
     print(f"Video: {in_w}x{in_h} -> {target_w}x{target_h}, "
           f"{total_frames or '?'} frames at {framerate:.2f} fps")
 
+    # ── Determine available modes ────────────────────────────────────
+    scale = upsampler.scale
+    optimal_in_w = target_w // scale
+    optimal_in_h = target_h // scale
+    fast_available = (optimal_in_w < in_w) and (optimal_in_h < in_h)
+
+    # ── Test frame ───────────────────────────────────────────────────
+    print("\nProcessing test frame...")
+    test_frame = extract_first_frame(input_path, in_w, in_h)
+    use_fast = False  # default; may be overridden by user choice below
+    if test_frame is None:
+        print("Warning: Could not extract test frame, skipping preview.")
+    else:
+        preview_dir = os.path.dirname(output_path) or "."
+
+        # Quality mode
+        t0 = time.time()
+        quality_out, _ = upsampler.enhance(test_frame)
+        quality_out = cv2.resize(quality_out, target_resolution,
+                                 interpolation=cv2.INTER_LANCZOS4)
+        quality_time = time.time() - t0
+        quality_preview = os.path.join(preview_dir, "test_frame_quality.png")
+        cv2.imwrite(quality_preview, quality_out)
+        del quality_out
+
+        # Fast mode (if applicable)
+        fast_time = None
+        fast_preview = None
+        if fast_available:
+            pre_resized = cv2.resize(test_frame, (optimal_in_w, optimal_in_h),
+                                     interpolation=cv2.INTER_LANCZOS4)
+            t0 = time.time()
+            fast_out, _ = upsampler.enhance(pre_resized)
+            fast_out = cv2.resize(fast_out, target_resolution,
+                                  interpolation=cv2.INTER_LANCZOS4)
+            fast_time = time.time() - t0
+            fast_preview = os.path.join(preview_dir, "test_frame_fast.png")
+            cv2.imwrite(fast_preview, fast_out)
+            del fast_out, pre_resized
+
+        del test_frame
+
+        # ── Show results ─────────────────────────────────────────────
+        print(f"\n{'=' * 55}")
+        print("  TEST FRAME RESULTS")
+        print(f"{'=' * 55}")
+        print(f"  [1] Quality : {quality_time:.1f}s/frame "
+              f"(ETA {_format_eta(quality_time, total_frames)})")
+        print(f"      Preview : {quality_preview}")
+        if fast_available and fast_time is not None:
+            speedup = quality_time / fast_time if fast_time > 0 else 0
+            print(f"  [2] Fast    : {fast_time:.1f}s/frame "
+                  f"(ETA {_format_eta(fast_time, total_frames)}, "
+                  f"{speedup:.1f}x faster)")
+            print(f"      Preview : {fast_preview}")
+            print(f"      (input pre-resized {in_w}x{in_h} -> "
+                  f"{optimal_in_w}x{optimal_in_h})")
+        print(f"{'=' * 55}")
+
+        # ── User choice ──────────────────────────────────────────────
+        try:
+            if fast_available:
+                choice = input("\nChoose mode [1/2] or 'q' to quit: ").strip().lower()
+                if choice == 'q':
+                    print("Cancelled.")
+                    return
+                use_fast = (choice == '2')
+            else:
+                choice = input("\nProceed? [y/N]: ").strip().lower()
+                if choice not in ('y', 'yes'):
+                    print("Cancelled.")
+                    return
+                use_fast = False
+        except EOFError:
+            pass  # non-interactive: keep default (quality)
+
+    # ── Full pipeline ────────────────────────────────────────────────
     with tempfile.TemporaryDirectory() as temp_dir:
-        # Extract audio to a temp file (only file we write to disk).
         audio_path = os.path.join(temp_dir, "audio.aac")
         if has_audio:
             print("Extracting audio...")
             try:
                 subprocess.run(
-                    ["ffmpeg", "-i", input_path, "-vn", "-acodec", "copy", audio_path],
+                    ["ffmpeg", "-i", input_path, "-vn", "-acodec", "copy",
+                     audio_path],
                     check=True, capture_output=True, text=True
                 )
             except subprocess.CalledProcessError as e:
                 print(f"Error extracting audio: {e.stderr}")
                 return
 
-        # --- Decode pipe: ffmpeg decodes video -> raw BGR24 frames -> stdout ---
+        # Decode pipe: ffmpeg -> raw BGR24 frames -> stdout
         decode_cmd = [
             "ffmpeg", "-i", input_path,
             "-f", "rawvideo", "-pix_fmt", "bgr24",
@@ -472,7 +600,7 @@ def upscale_video(input_path, output_path, upsampler, target_resolution):
         ]
         decode_proc = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE)
 
-        # --- Encode pipe: stdin raw BGR24 frames -> ffmpeg encodes -> output file ---
+        # Encode pipe: stdin raw BGR24 frames -> ffmpeg -> output file
         encode_cmd = [
             "ffmpeg", "-y",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
@@ -489,35 +617,45 @@ def upscale_video(input_path, output_path, upsampler, target_resolution):
         ])
         encode_proc = subprocess.Popen(encode_cmd, stdin=subprocess.PIPE)
 
-        # --- Threaded pipeline ---
+        # Threaded pipeline
         read_q = queue.Queue(maxsize=4)
         write_q = queue.Queue(maxsize=4)
         error_event = threading.Event()
         frame_byte_size = in_w * in_h * 3
 
         def reader():
-            """Reads raw decoded frames from the ffmpeg decode pipe."""
+            """Reads decoded frames; optionally pre-resizes for fast mode."""
             try:
                 while not error_event.is_set():
                     raw = decode_proc.stdout.read(frame_byte_size)
                     if len(raw) < frame_byte_size:
-                        read_q.put(None)  # EOF sentinel
+                        read_q.put(None)  # EOF
                         break
-                    frame = np.frombuffer(raw, dtype=np.uint8).reshape(in_h, in_w, 3).copy()
+                    frame = np.frombuffer(
+                        raw, dtype=np.uint8
+                    ).reshape(in_h, in_w, 3).copy()
+                    if use_fast:
+                        frame = cv2.resize(
+                            frame, (optimal_in_w, optimal_in_h),
+                            interpolation=cv2.INTER_LANCZOS4)
                     read_q.put(frame)
             except Exception:
                 error_event.set()
                 read_q.put(None)
 
         def writer():
-            """Resizes upscaled frames and writes them to the ffmpeg encode pipe."""
+            """Resizes if needed and writes frames to the encode pipe."""
             try:
                 while not error_event.is_set():
                     item = write_q.get()
                     if item is None:
                         break
-                    final = cv2.resize(item, target_resolution, interpolation=cv2.INTER_LANCZOS4)
-                    encode_proc.stdin.write(final.tobytes())
+                    h_out, w_out = item.shape[:2]
+                    if w_out != target_w or h_out != target_h:
+                        item = cv2.resize(
+                            item, target_resolution,
+                            interpolation=cv2.INTER_LANCZOS4)
+                    encode_proc.stdin.write(item.tobytes())
             except Exception:
                 error_event.set()
 
@@ -526,8 +664,8 @@ def upscale_video(input_path, output_path, upsampler, target_resolution):
         reader_thread.start()
         writer_thread.start()
 
-        # --- Main thread: GPU inference ---
-        print("Starting pipelined upscaling (decode -> GPU -> encode)...")
+        mode_label = "fast" if use_fast else "quality"
+        print(f"\nStarting pipelined upscaling ({mode_label} mode)...")
         frame_times = []
         i = 0
         try:
@@ -550,12 +688,10 @@ def upscale_video(input_path, output_path, upsampler, target_resolution):
                 frame_times.append(frame_elapsed)
 
                 if i == 0 and total_frames:
-                    est_total = frame_elapsed * total_frames
-                    est_min, est_sec = divmod(int(est_total), 60)
-                    est_hr, est_min = divmod(est_min, 60)
-                    print(f"\nFirst frame took {frame_elapsed:.2f}s. "
-                          f"Estimated total time: {est_hr}h{est_min:02d}m{est_sec:02d}s "
-                          f"for {total_frames} frames. Press Ctrl+C to cancel.\n")
+                    print(f"\nFirst frame: {frame_elapsed:.2f}s. "
+                          f"Est. total: "
+                          f"{_format_eta(frame_elapsed, total_frames)} "
+                          f"for {total_frames} frames. Ctrl+C to cancel.\n")
 
                 frames_done = i + 1
                 if total_frames:
@@ -564,11 +700,14 @@ def upscale_video(input_path, output_path, upsampler, target_resolution):
                     eta_min, eta_sec = divmod(int(remaining), 60)
                     eta_hr, eta_min = divmod(eta_min, 60)
                     pct = 100.0 * frames_done / total_frames
-                    print(f"Frame {frames_done}/{total_frames} [{pct:5.1f}%] "
-                          f"({frame_elapsed:.2f}s/frame, "
-                          f"ETA: {eta_hr}h{eta_min:02d}m{eta_sec:02d}s)  ", end="\r")
+                    print(
+                        f"Frame {frames_done}/{total_frames} [{pct:5.1f}%] "
+                        f"({frame_elapsed:.2f}s/frame, "
+                        f"ETA: {eta_hr}h{eta_min:02d}m{eta_sec:02d}s)  ",
+                        end="\r")
                 else:
-                    print(f"Frame {frames_done} ({frame_elapsed:.2f}s/frame)  ", end="\r")
+                    print(f"Frame {frames_done} "
+                          f"({frame_elapsed:.2f}s/frame)  ", end="\r")
                 i += 1
 
         except KeyboardInterrupt:
@@ -576,7 +715,7 @@ def upscale_video(input_path, output_path, upsampler, target_resolution):
             error_event.set()
             write_q.put(None)
 
-        # --- Cleanup ---
+        # Cleanup
         writer_thread.join(timeout=10)
         try:
             encode_proc.stdin.close()
@@ -594,8 +733,8 @@ def upscale_video(input_path, output_path, upsampler, target_resolution):
     total_processed = len(frame_times)
     avg = (end_time - start_time) / total_processed if total_processed else 0
     print(f"\nSuccessfully created upscaled video at {output_path}")
-    print(f"Processed {total_processed} frames in {end_time - start_time:.2f}s "
-          f"({avg:.2f}s/frame avg).")
+    print(f"Processed {total_processed} frames in "
+          f"{end_time - start_time:.2f}s ({avg:.2f}s/frame avg).")
 
 def process_file(input_file, output_file, args, upsampler):
     input_resolution = get_input_resolution(input_file)
