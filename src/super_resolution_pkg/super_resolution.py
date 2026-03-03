@@ -195,10 +195,14 @@ def run_mps_diagnostics(upsampler):
         all_passed = False
 
     # ── 4. Tensor matmul benchmark (MPS vs CPU) ─────────────────
+    # This is informational only. Apple's AMX coprocessor makes CPU matmul
+    # extremely fast for small matrices, so MPS dispatch overhead can dominate
+    # at small sizes. The real inference benchmark (check 5) is the definitive
+    # pass/fail test.
     print(f"\n{SEPARATOR}")
-    print("4. Tensor Matmul Benchmark (1024x1024, 10 iterations)")
+    print("4. Tensor Matmul Benchmark (4096x4096, 10 iterations) [informational]")
     print(SEPARATOR)
-    size = 1024
+    size = 4096
     iters = 10
 
     # CPU timing
@@ -222,13 +226,10 @@ def run_mps_diagnostics(upsampler):
         torch.mps.synchronize()
         mps_elapsed = time.time() - mps_start
         speedup = cpu_elapsed / mps_elapsed if mps_elapsed > 0 else 0
-        matmul_ok = speedup > 1.0
         print(f"  MPS total     : {mps_elapsed:.3f}s ({mps_elapsed/iters*1000:.1f}ms/iter)")
         print(f"  Speedup       : {speedup:.1f}x")
-        print(f"  Result        : [{result_tag(matmul_ok)}]"
-              + ("" if matmul_ok else " (MPS slower than CPU — unexpected)"))
-        if not matmul_ok:
-            all_passed = False
+        if speedup <= 1.0:
+            print(f"  Note          : MPS slower at this size; Apple AMX is very fast for BLAS ops.")
         del a_mps, b_mps
     else:
         print("  MPS           : skipped (not available)")
@@ -324,10 +325,12 @@ def initialize_upsampler(scale):
     )
 
     # Verify the model actually landed on the expected device.
+    # Compare by device type (e.g. "mps") rather than string representation
+    # because PyTorch may report "mps:0" even when we requested "mps".
     actual_device = next(upsampler.model.parameters()).device
     print(f"Model loaded on device: {actual_device}")
-    if str(actual_device) != str(device):
-        print(f"WARNING: Expected device '{device}', but model is on '{actual_device}'.")
+    if actual_device.type != device.type:
+        print(f"WARNING: Expected device type '{device.type}', but model is on '{actual_device}'.")
 
     # Warm up the MPS pipeline. The first inference triggers Metal shader
     # compilation which is very slow; doing it on a tiny image avoids counting
