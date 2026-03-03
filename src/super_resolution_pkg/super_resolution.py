@@ -770,6 +770,7 @@ def main():
     parser.add_argument("output_path", help="Path to save the output file or directory.")
     parser.add_argument("--scale", type=float, help="Upscaling factor (e.g., 1.5, 2.0). Mutually exclusive with --target-resolution.")
     parser.add_argument("--target-resolution", type=str, help="Target resolution (e.g., 1080p, 4k). Mutually exclusive with --scale.")
+    parser.add_argument("--diagnostics", action="store_true", help="Run full MPS diagnostics before processing (slow, for debugging).")
     
     args = parser.parse_args()
 
@@ -822,7 +823,8 @@ def main():
     if upsampler is None:
         exit()
 
-    run_mps_diagnostics(upsampler)
+    if args.diagnostics:
+        run_mps_diagnostics(upsampler)
 
     if os.path.isdir(args.input_path):
         if not os.path.exists(args.output_path):
