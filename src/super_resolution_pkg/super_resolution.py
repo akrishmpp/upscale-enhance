@@ -2,10 +2,15 @@ import os
 import subprocess
 import tempfile
 import argparse
+import platform
 import cv2
 import shutil
 import time
 import torch
+import numpy as np
+
+# Allow MPS to fall back to CPU for any unsupported ops, rather than crashing.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 # Compatibility shim: basicsr imports torchvision.transforms.functional_tensor,
 # which was removed in torchvision >= 0.16. Patch it before importing basicsr.
@@ -116,6 +121,175 @@ def get_device_config():
         return None, False, torch.device('cpu')
 
 
+def run_mps_diagnostics(upsampler):
+    """Run thorough checks to verify MPS is actually being used for inference.
+
+    Prints a diagnostic report covering:
+      1. System / PyTorch environment
+      2. MPS backend availability
+      3. Model parameter placement (every parameter on the expected device)
+      4. Basic tensor matmul benchmark (MPS vs CPU)
+      5. Real model inference benchmark (MPS vs CPU) on a 256x256 test image
+    Returns True if all checks pass, False otherwise.
+    """
+    SEPARATOR = "-" * 60
+    all_passed = True
+
+    print("\n" + "=" * 60)
+    print("  MPS DEVICE DIAGNOSTICS")
+    print("=" * 60)
+
+    # ── 1. System info ───────────────────────────────────────────
+    print(f"\n{SEPARATOR}")
+    print("1. System Information")
+    print(SEPARATOR)
+    print(f"  Platform     : {platform.platform()}")
+    print(f"  Processor    : {platform.processor() or 'N/A'}")
+    print(f"  Python       : {platform.python_version()}")
+    print(f"  PyTorch      : {torch.__version__}")
+
+    # ── 2. MPS backend availability ──────────────────────────────
+    print(f"\n{SEPARATOR}")
+    print("2. MPS Backend Availability")
+    print(SEPARATOR)
+    mps_built = torch.backends.mps.is_built()
+    mps_available = torch.backends.mps.is_available()
+    print(f"  MPS built into PyTorch : {mps_built}")
+    print(f"  MPS device available   : {mps_available}")
+    if mps_available:
+        # Basic allocation test
+        try:
+            t = torch.zeros(1, device="mps")
+            del t
+            print(f"  MPS tensor allocation  : OK")
+        except Exception as e:
+            print(f"  MPS tensor allocation  : FAILED ({e})")
+            all_passed = False
+    else:
+        print("  ** MPS is NOT available. Model will run on CPU. **")
+        all_passed = False
+
+    result_tag = lambda ok: "PASS" if ok else "FAIL"
+
+    # ── 3. Model parameter device check ──────────────────────────
+    print(f"\n{SEPARATOR}")
+    print("3. Model Parameter Device Check")
+    print(SEPARATOR)
+    expected_device_type = "mps" if mps_available else "cpu"
+    total_params = 0
+    misplaced_params = 0
+    for name, param in upsampler.model.named_parameters():
+        total_params += 1
+        if param.device.type != expected_device_type:
+            misplaced_params += 1
+            if misplaced_params <= 5:  # only print first few
+                print(f"  MISPLACED: {name} -> {param.device}")
+    if misplaced_params > 5:
+        print(f"  ... and {misplaced_params - 5} more misplaced parameters")
+    params_ok = misplaced_params == 0
+    print(f"  Total parameters : {total_params}")
+    print(f"  On '{expected_device_type}'      : {total_params - misplaced_params}")
+    print(f"  Misplaced        : {misplaced_params}")
+    print(f"  Result           : [{result_tag(params_ok)}]")
+    if not params_ok:
+        all_passed = False
+
+    # ── 4. Tensor matmul benchmark (MPS vs CPU) ─────────────────
+    print(f"\n{SEPARATOR}")
+    print("4. Tensor Matmul Benchmark (1024x1024, 10 iterations)")
+    print(SEPARATOR)
+    size = 1024
+    iters = 10
+
+    # CPU timing
+    a_cpu = torch.randn(size, size, device="cpu")
+    b_cpu = torch.randn(size, size, device="cpu")
+    torch.matmul(a_cpu, b_cpu)  # warmup
+    cpu_start = time.time()
+    for _ in range(iters):
+        torch.matmul(a_cpu, b_cpu)
+    cpu_elapsed = time.time() - cpu_start
+    print(f"  CPU total     : {cpu_elapsed:.3f}s ({cpu_elapsed/iters*1000:.1f}ms/iter)")
+
+    if mps_available:
+        a_mps = torch.randn(size, size, device="mps")
+        b_mps = torch.randn(size, size, device="mps")
+        torch.matmul(a_mps, b_mps)
+        torch.mps.synchronize()  # warmup
+        mps_start = time.time()
+        for _ in range(iters):
+            torch.matmul(a_mps, b_mps)
+        torch.mps.synchronize()
+        mps_elapsed = time.time() - mps_start
+        speedup = cpu_elapsed / mps_elapsed if mps_elapsed > 0 else 0
+        matmul_ok = speedup > 1.0
+        print(f"  MPS total     : {mps_elapsed:.3f}s ({mps_elapsed/iters*1000:.1f}ms/iter)")
+        print(f"  Speedup       : {speedup:.1f}x")
+        print(f"  Result        : [{result_tag(matmul_ok)}]"
+              + ("" if matmul_ok else " (MPS slower than CPU — unexpected)"))
+        if not matmul_ok:
+            all_passed = False
+        del a_mps, b_mps
+    else:
+        print("  MPS           : skipped (not available)")
+    del a_cpu, b_cpu
+
+    # ── 5. Real model inference benchmark ────────────────────────
+    print(f"\n{SEPARATOR}")
+    print("5. Real-ESRGAN Inference Benchmark (256x256 test image)")
+    print(SEPARATOR)
+    test_img = np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8)
+
+    if mps_available:
+        # Time on MPS (model is already there)
+        upsampler.enhance(test_img)  # warmup
+        torch.mps.synchronize()
+        mps_start = time.time()
+        upsampler.enhance(test_img)
+        torch.mps.synchronize()
+        mps_infer = time.time() - mps_start
+        print(f"  MPS inference : {mps_infer:.3f}s")
+
+        # Move model to CPU, time, then move back
+        upsampler.model.cpu()
+        upsampler.device = torch.device("cpu")
+        upsampler.enhance(test_img)  # warmup
+        cpu_start = time.time()
+        upsampler.enhance(test_img)
+        cpu_infer = time.time() - cpu_start
+        print(f"  CPU inference : {cpu_infer:.3f}s")
+
+        speedup = cpu_infer / mps_infer if mps_infer > 0 else 0
+        infer_ok = speedup > 1.0
+        print(f"  Speedup       : {speedup:.1f}x")
+        print(f"  Result        : [{result_tag(infer_ok)}]"
+              + ("" if infer_ok else " (MPS not faster — ops may be falling back to CPU)"))
+        if not infer_ok:
+            all_passed = False
+
+        # Restore model to MPS
+        upsampler.model.to(torch.device("mps"))
+        upsampler.device = torch.device("mps")
+        torch.mps.synchronize()
+    else:
+        cpu_start = time.time()
+        upsampler.enhance(test_img)
+        cpu_infer = time.time() - cpu_start
+        print(f"  CPU inference : {cpu_infer:.3f}s")
+        print(f"  MPS           : skipped (not available)")
+
+    # ── Summary ──────────────────────────────────────────────────
+    print(f"\n{'=' * 60}")
+    if all_passed:
+        print("  DIAGNOSTICS PASSED: MPS is active and accelerating inference.")
+    else:
+        print("  DIAGNOSTICS WARNING: One or more checks failed.")
+        print("  The model may be running on CPU or MPS is underperforming.")
+    print("=" * 60 + "\n")
+
+    return all_passed
+
+
 def initialize_upsampler(scale):
     """Initializes the Real-ESRGAN upsampler."""
     base_model_dir = os.path.join(os.path.dirname(__file__), "models")
@@ -131,18 +305,40 @@ def initialize_upsampler(scale):
 
     gpu_id, use_half, device = get_device_config()
 
+    # Use tiling on MPS/CPU to reduce peak memory usage.
+    # Full-frame inference in FP32 on MPS can exhaust unified memory and cause
+    # the system to swap, which tanks performance.
+    tile = 0 if gpu_id is not None else 512
+
     print(f"Initializing Real-ESRGAN model for {scale}x upscaling...")
     upsampler = RealESRGANer(
         scale=scale,
         model_path=model_path,
         model=model,
-        tile=0,
+        tile=tile,
         tile_pad=10,
         pre_pad=0,
         half=use_half,
         gpu_id=gpu_id,
         device=device
     )
+
+    # Verify the model actually landed on the expected device.
+    actual_device = next(upsampler.model.parameters()).device
+    print(f"Model loaded on device: {actual_device}")
+    if str(actual_device) != str(device):
+        print(f"WARNING: Expected device '{device}', but model is on '{actual_device}'.")
+
+    # Warm up the MPS pipeline. The first inference triggers Metal shader
+    # compilation which is very slow; doing it on a tiny image avoids counting
+    # that cost against real frames.
+    if device.type == "mps":
+        print("Warming up MPS pipeline (compiling Metal shaders)...")
+        dummy = np.zeros((64, 64, 3), dtype=np.uint8)
+        upsampler.enhance(dummy)
+        torch.mps.synchronize()
+        print("MPS pipeline ready.")
+
     return upsampler
 
 
@@ -216,20 +412,41 @@ def upscale_video(input_path, output_path, upsampler, target_resolution):
         print(f"Successfully extracted {total_frames} frames.")
 
         print("Starting frame upscaling...")
+        frame_times = []
         for i, frame_name in enumerate(frame_files):
+            frame_start = time.time()
             frame_path = os.path.join(frames_dir, frame_name)
             img = cv2.imread(frame_path, cv2.IMREAD_UNCHANGED)
-            
+
             try:
                 upscaled_img, _ = upsampler.enhance(img)
                 final_img = cv2.resize(upscaled_img, target_resolution, interpolation=cv2.INTER_LANCZOS4)
                 save_path = os.path.join(upscaled_frames_dir, frame_name)
                 cv2.imwrite(save_path, final_img)
             except Exception as e:
-                print(f"Error upscaling frame {frame_name}: {e}")
+                print(f"\nError upscaling frame {frame_name}: {e}")
                 return # Stop processing
-            
-            print(f"Upscaled frame {i + 1}/{total_frames}", end="\r")
+
+            frame_elapsed = time.time() - frame_start
+            frame_times.append(frame_elapsed)
+
+            # After the first real frame, print a prominent timing report so the
+            # user can decide whether to continue or abort.
+            if i == 0:
+                est_total = frame_elapsed * total_frames
+                est_min, est_sec = divmod(int(est_total), 60)
+                est_hr, est_min = divmod(est_min, 60)
+                print(f"\nFirst frame took {frame_elapsed:.2f}s. "
+                      f"Estimated total time: {est_hr}h{est_min:02d}m{est_sec:02d}s "
+                      f"for {total_frames} frames. Press Ctrl+C to cancel.\n")
+
+            avg_time = sum(frame_times) / len(frame_times)
+            remaining = avg_time * (total_frames - (i + 1))
+            eta_min, eta_sec = divmod(int(remaining), 60)
+            eta_hr, eta_min = divmod(eta_min, 60)
+            pct = 100.0 * (i + 1) / total_frames
+            print(f"Frame {i + 1}/{total_frames} [{pct:5.1f}%] "
+                  f"({frame_elapsed:.2f}s/frame, ETA: {eta_hr}h{eta_min:02d}m{eta_sec:02d}s)  ", end="\r")
 
         print("\nUpscaling complete.")
         
@@ -345,6 +562,8 @@ def main():
     upsampler = initialize_upsampler(model_scale)
     if upsampler is None:
         exit()
+
+    run_mps_diagnostics(upsampler)
 
     if os.path.isdir(args.input_path):
         if not os.path.exists(args.output_path):
