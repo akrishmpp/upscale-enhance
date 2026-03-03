@@ -102,6 +102,26 @@ def has_audio_stream(video_path):
         return False
 
 
+def get_system_memory_gb():
+    """Returns total physical memory in GB, or None if detection fails."""
+    try:
+        # macOS: sysctl hw.memsize returns total bytes
+        result = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            capture_output=True, text=True, check=True
+        )
+        return int(result.stdout.strip()) / (1024 ** 3)
+    except Exception:
+        pass
+    try:
+        # Linux fallback
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return pages * page_size / (1024 ** 3)
+    except Exception:
+        return None
+
+
 def get_device_config():
     """Detects the best available hardware and returns (gpu_id, use_half, device) configuration.
 
@@ -143,8 +163,10 @@ def run_mps_diagnostics(upsampler):
     print(f"\n{SEPARATOR}")
     print("1. System Information")
     print(SEPARATOR)
+    mem_gb = get_system_memory_gb()
     print(f"  Platform     : {platform.platform()}")
     print(f"  Processor    : {platform.processor() or 'N/A'}")
+    print(f"  Memory       : {f'{mem_gb:.0f} GB' if mem_gb else 'unknown'}")
     print(f"  Python       : {platform.python_version()}")
     print(f"  PyTorch      : {torch.__version__}")
 
@@ -306,11 +328,31 @@ def initialize_upsampler(scale):
 
     gpu_id, use_half, device = get_device_config()
 
-    # Use tiling on MPS/CPU to reduce peak memory usage.
-    # Full-frame inference in FP32 on MPS can exhaust unified memory and cause
-    # the system to swap, which tanks performance.
-    tile = 0 if gpu_id is not None else 512
+    # Pick tile size based on device and available memory.
+    # tile=0 means no tiling (full-frame inference, fastest but most memory).
+    if gpu_id is not None:
+        # CUDA: dedicated VRAM, no tiling needed
+        tile = 0
+    elif device.type == "mps":
+        # Apple Silicon: GPU shares unified memory with CPU.
+        # Larger tiles = fewer GPU dispatch round-trips = much faster.
+        # A 720p frame with tile=512 produces 6 tiles; tile=0 does it in one pass.
+        mem_gb = get_system_memory_gb()
+        if mem_gb is not None:
+            print(f"System memory: {mem_gb:.0f} GB")
+            if mem_gb >= 16:
+                tile = 0     # no tiling — 720p/1080p fits comfortably
+            elif mem_gb >= 8:
+                tile = 768   # 2 tiles for 720p instead of 6
+            else:
+                tile = 512
+        else:
+            tile = 512  # safe fallback if detection fails
+    else:
+        # CPU: conservative tiling
+        tile = 512
 
+    print(f"Tile size: {tile if tile > 0 else 'disabled (full-frame)'}")
     print(f"Initializing Real-ESRGAN model for {scale}x upscaling...")
     upsampler = RealESRGANer(
         scale=scale,
